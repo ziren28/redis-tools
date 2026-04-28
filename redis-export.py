@@ -81,11 +81,9 @@ def do_dump(args):
             ktype = src.type(key).decode()
             ttl = src.ttl(key)
             key_str = key.decode(errors="replace")
-
             if args.dry_run:
                 count += 1
                 continue
-
             val = None
             if ktype == "string":
                 v = src.get(key)
@@ -98,10 +96,8 @@ def do_dump(args):
                 val = [(v.decode(errors="replace"), s) for v, s in src.zrange(key, 0, -1, withscores=True)]
             elif ktype == "hash":
                 val = {k.decode(errors="replace"): v.decode(errors="replace") for k, v in src.hgetall(key).items()}
-
             data.append({"key": key_str, "type": ktype, "ttl": ttl, "value": val})
             count += 1
-
         if not args.dry_run:
             output = output.replace(".rdb", ".json")
             with open(output, "w", encoding="utf-8") as f:
@@ -137,20 +133,16 @@ def do_push(args):
         if args.dry_run:
             count += 1
             continue
-
         try:
             pttl = src.pttl(key)
             if pttl < 0:
                 pttl = 0
-
             dumped = src.dump(key)
             if dumped is None:
                 continue
-
-            dst.delete(key)
             dst.restore(key, pttl, dumped, replace=True)
             count += 1
-        except Exception as e:
+        except Exception:
             errors += 1
 
         total = count + errors
@@ -179,36 +171,42 @@ def do_upload(args):
         err("上传失败")
     os.remove(output)
 
+def add_common_args(p):
+    p.add_argument("--host", default="127.0.0.1", help="源 Redis 地址 (默认: 127.0.0.1)")
+    p.add_argument("-p", "--port", type=int, default=6379, help="源 Redis 端口 (默认: 6379)")
+    p.add_argument("-a", "--auth", default="", help="源 Redis 密码")
+    p.add_argument("-d", "--db", type=int, default=0, help="数据库编号 (默认: 0)")
+    p.add_argument("-k", "--keys", default="*", help="Key 匹配模式 (默认: *)")
+    p.add_argument("-o", "--output", default="", help="导出文件路径")
+    p.add_argument("--flush", action="store_true", help="推送前清空目标")
+    p.add_argument("--dry-run", action="store_true", help="仅统计不执行")
+
 def main():
-    parser = argparse.ArgumentParser(description="Redis 数据库导出同步工具", formatter_class=argparse.RawDescriptionHelpFormatter,
+    parser = argparse.ArgumentParser(
+        description="Redis 数据库导出同步工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
   %(prog)s dump -a mypass
   %(prog)s dump -a mypass -k "user:*" -o /tmp/users.rdb
   %(prog)s push 8.218.250.240 6379 targetpass -a mypass --flush
-  %(prog)s push 10.0.0.5 6379 pass -a mypass -k "session:*"
+  %(prog)s push 10.0.0.5 6379 pass -k "session:*"
   %(prog)s upload -a mypass
         """)
 
-    parser.add_argument("--host", default="127.0.0.1", help="源 Redis 地址 (默认: 127.0.0.1)")
-    parser.add_argument("-p", "--port", type=int, default=6379, help="源 Redis 端口 (默认: 6379)")
-    parser.add_argument("-a", "--auth", default="", help="源 Redis 密码")
-    parser.add_argument("-d", "--db", type=int, default=0, help="数据库编号 (默认: 0)")
-    parser.add_argument("-k", "--keys", default="*", help="Key 匹配模式 (默认: *)")
-    parser.add_argument("-o", "--output", default="", help="导出文件路径")
-    parser.add_argument("--flush", action="store_true", help="推送前清空目标")
-    parser.add_argument("--dry-run", action="store_true", help="仅统计不执行")
-
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("dump", help="导出到文件")
+    dump_p = sub.add_parser("dump", help="导出到文件")
+    add_common_args(dump_p)
 
     push_p = sub.add_parser("push", help="推送到远程 Redis")
     push_p.add_argument("dst_host", help="目标地址")
     push_p.add_argument("dst_port", type=int, help="目标端口")
     push_p.add_argument("dst_auth", nargs="?", default="", help="目标密码")
+    add_common_args(push_p)
 
-    sub.add_parser("upload", help="导出并上传网盘")
+    upload_p = sub.add_parser("upload", help="导出并上传网盘")
+    add_common_args(upload_p)
 
     args = parser.parse_args()
 
