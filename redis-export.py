@@ -110,6 +110,115 @@ def do_dump(args):
         else:
             info(f"[dry-run] 匹配 {count} 个 key")
 
+def sync_env(args):
+    """同步本机 .env 配置到远程服务器"""
+    app_dir = args.app_dir
+    env_file = os.path.join(app_dir, ".env")
+
+    if not os.path.exists(env_file):
+        err(f"本地 .env 不存在: {env_file}")
+        return False
+
+    # 读取本地 .env 中需要同步的 key
+    sync_keys = ["ENCRYPTION_KEY", "ADMIN_PASSWORD", "JWT_SECRET"]
+    local_env = {}
+    with open(env_file, "r") as f:
+        for line in f:
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                if k in sync_keys:
+                    local_env[k] = v
+
+    if not local_env:
+        warn("本地 .env 中没有找到需要同步的配置")
+        return False
+
+    title("同步应用配置")
+    for k, v in local_env.items():
+        info(f"本地 {k}={v[:8]}...{v[-4:]}" if len(v) > 12 else f"本地 {k}={v}")
+
+    # SSH 到远程更新 .env
+    ssh_key = args.ssh_key
+    ssh_user = args.ssh_user
+    dst_host = args.dst_host
+    remote_app_dir = args.remote_app_dir
+
+    ssh_base = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10"]
+    if ssh_key:
+        ssh_base += ["-i", ssh_key]
+
+    remote = f"{ssh_user}@{dst_host}"
+
+    # 读取远程 .env
+    result = subprocess.run(
+        ssh_base + [remote, f"cat {remote_app_dir}/.env"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        err(f"无法读取远程 .env: {result.stderr.strip()}")
+        return False
+
+    remote_lines = result.stdout.strip().split("\n")
+    updated = []
+    changed = []
+    for line in remote_lines:
+        matched = False
+        for k, v in local_env.items():
+            if line.startswith(f"{k}="):
+                old_v = line.split("=", 1)[1]
+                if old_v != v:
+                    changed.append(f"{k}: {old_v[:8]}... -> {v[:8]}...")
+                updated.append(f"{k}={v}")
+                matched = True
+                break
+        if not matched:
+            updated.append(line)
+
+    if not changed:
+        info("远程配置已经一致，无需更新")
+        return True
+
+    for c in changed:
+        warn(f"变更: {c}")
+
+    # 写入远程 .env
+    new_env = "\n".join(updated) + "\n"
+    result = subprocess.run(
+        ssh_base + [remote, f"sudo tee {remote_app_dir}/.env > /dev/null"],
+        input=new_env, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        err(f"写入远程 .env 失败: {result.stderr.strip()}")
+        return False
+    info("远程 .env 已更新")
+
+    # 重启远程应用
+    info("重启远程应用...")
+    restart_cmds = [
+        "sudo systemctl restart claude-relay-service 2>/dev/null",
+        "|| sudo pm2 restart all 2>/dev/null",
+        "|| (sudo kill $(pgrep -f 'node.*app.js') 2>/dev/null; sleep 1;",
+        f"sudo bash -c 'cd {remote_app_dir} && nohup node src/app.js > /tmp/crs.log 2>&1 &')",
+    ]
+    subprocess.run(
+        ssh_base + [remote, " ".join(restart_cmds)],
+        capture_output=True
+    )
+    time.sleep(3)
+
+    # 验证
+    result = subprocess.run(
+        ssh_base + [remote, "pgrep -f 'node.*app.js'"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        info("远程应用已重启")
+    else:
+        warn("远程应用可能未启动，请手动检查")
+
+    return True
+
 def do_push(args):
     src = connect(args.src_host, args.src_port, args.src_auth, args.src_db)
     dst = connect(args.dst_host, args.dst_port, args.dst_auth, args.src_db)
@@ -119,12 +228,18 @@ def do_push(args):
 
     if args.flush:
         warn("将在同步前清空目标!")
+    if args.sync_env:
+        warn("将同步 .env 配置 (ENCRYPTION_KEY 等)")
 
     if not args.yes:
         answer = input("确认推送? (yes/no): ")
         if answer != "yes":
             err("已取消")
             sys.exit(1)
+
+    # 同步 .env 配置
+    if args.sync_env:
+        sync_env(args)
 
     if args.flush:
         info("清空目标...")
@@ -191,7 +306,8 @@ def main():
   %(prog)s dump
   %(prog)s dump --src-auth mypass -k "user:*"
   %(prog)s push 8.218.250.240 6379 targetpass --flush -y
-  %(prog)s push 10.0.0.5 6379 pass --src-auth mypass -k "session:*"
+  %(prog)s push 10.0.0.5 6379 --flush -y --sync-env
+  %(prog)s push 10.0.0.5 6379 --flush -y --sync-env --ssh-key ~/.ssh/id_ed25519 --ssh-user admin
   %(prog)s upload --src-auth mypass
         """)
 
@@ -217,6 +333,11 @@ def main():
     push_p.add_argument("dst_auth", nargs="?", default="", help="目标密码")
     push_p.add_argument("--flush", action="store_true", help="推送前清空目标")
     push_p.add_argument("-y", "--yes", action="store_true", help="跳过确认")
+    push_p.add_argument("--sync-env", action="store_true", help="同步 .env 配置 (ENCRYPTION_KEY 等)")
+    push_p.add_argument("--app-dir", default="/root/claude-relay-service/app", help="本地应用目录 (默认: /root/claude-relay-service/app)")
+    push_p.add_argument("--remote-app-dir", default="/root/claude-relay-service/app", help="远程应用目录 (默认: /root/claude-relay-service/app)")
+    push_p.add_argument("--ssh-key", default="", help="SSH 私钥路径")
+    push_p.add_argument("--ssh-user", default="root", help="SSH 用户名 (默认: root)")
 
     # upload
     sub.add_parser("upload", parents=[common], help="导出并上传网盘")
