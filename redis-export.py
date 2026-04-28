@@ -53,15 +53,19 @@ def show_info(r, label, host, port):
     title(f"{label} Redis 信息")
     info(f"地址: {host}:{port}")
     info(f"Key 数: {r.dbsize()}")
+    ks = r.info("keyspace")
+    for db_name, db_info in ks.items():
+        if isinstance(db_info, dict):
+            info(f"  {db_name}: keys={db_info.get('keys',0)}, expires={db_info.get('expires',0)}")
 
 def do_dump(args):
-    src = connect(args.host, args.port, args.auth, args.db or 0)
-    show_info(src, "源", args.host, args.port)
+    src = connect(args.src_host, args.src_port, args.src_auth, args.src_db)
+    show_info(src, "源", args.src_host, args.src_port)
 
     output = args.output or f"/tmp/redis_export/redis_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.rdb"
     os.makedirs(os.path.dirname(output), exist_ok=True)
 
-    if args.keys == "*" and not args.db:
+    if args.keys == "*" and not args.src_db:
         title("导出 RDB")
         info("触发 BGSAVE...")
         src.bgsave()
@@ -107,19 +111,20 @@ def do_dump(args):
             info(f"[dry-run] 匹配 {count} 个 key")
 
 def do_push(args):
-    src = connect(args.host, args.port, args.auth, args.db or 0)
-    dst = connect(args.dst_host, args.dst_port, args.dst_auth, args.db or 0)
+    src = connect(args.src_host, args.src_port, args.src_auth, args.src_db)
+    dst = connect(args.dst_host, args.dst_port, args.dst_auth, args.src_db)
 
-    show_info(src, "源", args.host, args.port)
+    show_info(src, "源", args.src_host, args.src_port)
     show_info(dst, "目标", args.dst_host, args.dst_port)
 
     if args.flush:
         warn("将在同步前清空目标!")
 
-    answer = input("确认推送? (yes/no): ")
-    if answer != "yes":
-        err("已取消")
-        sys.exit(1)
+    if not args.yes:
+        answer = input("确认推送? (yes/no): ")
+        if answer != "yes":
+            err("已取消")
+            sys.exit(1)
 
     if args.flush:
         info("清空目标...")
@@ -128,6 +133,8 @@ def do_push(args):
     title("开始同步")
     count = 0
     errors = 0
+    skipped = 0
+    start_time = time.time()
 
     for key in src.scan_iter(match=args.keys, count=200):
         if args.dry_run:
@@ -139,21 +146,25 @@ def do_push(args):
                 pttl = 0
             dumped = src.dump(key)
             if dumped is None:
+                skipped += 1
                 continue
             dst.restore(key, pttl, dumped, replace=True)
             count += 1
         except Exception:
             errors += 1
 
-        total = count + errors
-        if total % 100 == 0 and total > 0:
-            print(f"\r  进度: {count} 成功, {errors} 失败  ", end="", flush=True)
+        total = count + errors + skipped
+        if total % 500 == 0 and total > 0:
+            elapsed = time.time() - start_time
+            speed = total / elapsed if elapsed > 0 else 0
+            print(f"\r  进度: {count} 成功, {errors} 失败, {skipped} 跳过 | {speed:.0f} keys/s  ", end="", flush=True)
 
+    elapsed = time.time() - start_time
     print()
     if args.dry_run:
         info(f"[dry-run] 匹配 {count} 个 key")
     else:
-        info(f"同步完成: 成功 {count}, 失败 {errors}")
+        info(f"同步完成: 成功 {count}, 失败 {errors}, 跳过 {skipped} | 耗时 {elapsed:.1f}s")
         info(f"目标现在: {dst.dbsize()}")
 
 def do_upload(args):
@@ -171,42 +182,44 @@ def do_upload(args):
         err("上传失败")
     os.remove(output)
 
-def add_common_args(p):
-    p.add_argument("--host", default="127.0.0.1", help="源 Redis 地址 (默认: 127.0.0.1)")
-    p.add_argument("-p", "--port", type=int, default=6379, help="源 Redis 端口 (默认: 6379)")
-    p.add_argument("-a", "--auth", default="", help="源 Redis 密码")
-    p.add_argument("-d", "--db", type=int, default=0, help="数据库编号 (默认: 0)")
-    p.add_argument("-k", "--keys", default="*", help="Key 匹配模式 (默认: *)")
-    p.add_argument("-o", "--output", default="", help="导出文件路径")
-    p.add_argument("--flush", action="store_true", help="推送前清空目标")
-    p.add_argument("--dry-run", action="store_true", help="仅统计不执行")
-
 def main():
     parser = argparse.ArgumentParser(
         description="Redis 数据库导出同步工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  %(prog)s dump -a mypass
-  %(prog)s dump -a mypass -k "user:*" -o /tmp/users.rdb
-  %(prog)s push 8.218.250.240 6379 targetpass -a mypass --flush
-  %(prog)s push 10.0.0.5 6379 pass -k "session:*"
-  %(prog)s upload -a mypass
+  %(prog)s dump
+  %(prog)s dump --src-auth mypass -k "user:*"
+  %(prog)s push 8.218.250.240 6379 targetpass --flush -y
+  %(prog)s push 10.0.0.5 6379 pass --src-auth mypass -k "session:*"
+  %(prog)s upload --src-auth mypass
         """)
 
     sub = parser.add_subparsers(dest="command")
 
-    dump_p = sub.add_parser("dump", help="导出到文件")
-    add_common_args(dump_p)
+    # 公共参数
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--src-host", default="127.0.0.1", help="源 Redis 地址 (默认: 127.0.0.1)")
+    common.add_argument("--src-port", type=int, default=6379, help="源 Redis 端口 (默认: 6379)")
+    common.add_argument("--src-auth", default="", help="源 Redis 密码")
+    common.add_argument("--src-db", type=int, default=0, help="数据库编号 (默认: 0)")
+    common.add_argument("-k", "--keys", default="*", help="Key 匹配模式 (默认: *)")
+    common.add_argument("-o", "--output", default="", help="导出文件路径")
+    common.add_argument("--dry-run", action="store_true", help="仅统计不执行")
 
-    push_p = sub.add_parser("push", help="推送到远程 Redis")
+    # dump
+    sub.add_parser("dump", parents=[common], help="导出到文件")
+
+    # push
+    push_p = sub.add_parser("push", parents=[common], help="推送到远程 Redis")
     push_p.add_argument("dst_host", help="目标地址")
     push_p.add_argument("dst_port", type=int, help="目标端口")
     push_p.add_argument("dst_auth", nargs="?", default="", help="目标密码")
-    add_common_args(push_p)
+    push_p.add_argument("--flush", action="store_true", help="推送前清空目标")
+    push_p.add_argument("-y", "--yes", action="store_true", help="跳过确认")
 
-    upload_p = sub.add_parser("upload", help="导出并上传网盘")
-    add_common_args(upload_p)
+    # upload
+    sub.add_parser("upload", parents=[common], help="导出并上传网盘")
 
     args = parser.parse_args()
 
