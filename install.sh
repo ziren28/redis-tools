@@ -4,7 +4,7 @@ GREEN='\033[0;32m'
 NC='\033[0m'
 info() { echo -e "${GREEN}[+]${NC} $1"; }
 
-REPO="https://raw.githubusercontent.com/ziren28/redis-tools/main"
+REPO="https://raw.githubusercontent.com/ziren28/redis-tools/master"
 INSTALL_DIR="/usr/local/bin"
 
 info "安装 Redis 工具集..."
