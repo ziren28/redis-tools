@@ -11,7 +11,19 @@ try:
     import redis
 except ImportError:
     print("[!] 正在安装 redis-py...")
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "redis", "-q"])
+    for cmd in [
+        [sys.executable, "-m", "pip", "install", "redis", "--break-system-packages", "-q"],
+        [sys.executable, "-m", "pip", "install", "redis", "-q"],
+        ["apt-get", "install", "-y", "python3-redis"],
+    ]:
+        try:
+            subprocess.check_call(cmd, stderr=subprocess.DEVNULL)
+            break
+        except Exception:
+            continue
+    else:
+        print("[-] 请手动安装: apt install python3-redis 或 pip install redis")
+        sys.exit(1)
     import redis
 
 GREEN = "\033[0;32m"
